@@ -4,7 +4,7 @@ A [Notion Worker](https://developers.notion.com) that mirrors your personal [Dis
 
 The database is created in Notion as **Discog Vinyls (Worker)** and refreshed once an hour.
 
-![A row showing the Discogs vinyl collection in Notion](docs/custom-tool.png)
+![Gallery view of the Discogs vinyl collection synced into Notion](docs/vinyl-collection.png)
 
 ## What gets synced
 
