@@ -1,3 +1,5 @@
+import { Jimp } from "jimp";
+
 import { Worker } from "@notionhq/workers";
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
@@ -11,6 +13,28 @@ const discogsApi = worker.pacer("discogsApi", {
 	allowedRequests: 50,
 	intervalMs: 60_000,
 });
+
+// Cover art is served from i.discogs.com, a plain image CDN that is separate from
+// the rate-limited api.discogs.com host, so it gets its own (more generous) budget.
+const discogsImages = worker.pacer("discogsImages", {
+	allowedRequests: 300,
+	intervalMs: 60_000,
+});
+
+// Notion caps a single rich text token at 2000 characters, so a base64 payload is
+// stored as a run of 2000-character tokens that concatenate back to the original.
+const RICH_TEXT_TOKEN_LIMIT = 2000;
+
+// Discogs serves cover art as a signed imgproxy URL, so the size params in the URL
+// can't be rewritten (a doctored URL returns 403). Covers are downloaded at their
+// native 600x600 and downscaled here instead, which keeps the encoded payload small
+// enough to sit comfortably inside Notion's rich text limits: a 100px cover encodes
+// to ~5-7k characters (3-4 tokens), against the 200,000-character / 100-token cap.
+const COVER_MAX_DIMENSION = 100;
+const COVER_JPEG_QUALITY = 80;
+
+// Releases fetched per execution.
+const COLLECTION_PAGE_SIZE = 100;
 
 // Discogs occasionally omits cover_image (e.g. when a release has no image).
 // Builder.file / Builder.imageIcon require a non-empty URL, so we fall back to
@@ -36,6 +60,8 @@ const collection = worker.database("vinylCollection", {
 			"Date Added": Schema.date(),
 			"Discogs URL": Schema.url(),
 			Cover: Schema.file(),
+			"Cover URL": Schema.url(),
+			"Cover Base64": Schema.richText(),
 			"Instance ID": Schema.richText(),
 			"Release ID": Schema.richText(),
 		},
@@ -56,7 +82,8 @@ worker.sync("collectionSync", {
 		await discogsApi.wait();
 		const data = await fetchCollectionPage({ username, token, page });
 
-		const changes = data.releases.map((item) => {
+		const changes = [];
+		for (const item of data.releases) {
 			const info = item.basic_information;
 			const releaseId = String(info.id);
 			const artistName = joinArtists(info.artists);
@@ -64,8 +91,9 @@ worker.sync("collectionSync", {
 
 			const coverUrl = info.cover_image || PLACEHOLDER_COVER;
 			const coverAlt = info.title ?? "cover";
+			const coverBase64 = await fetchResizedCoverAsBase64(coverUrl);
 
-			return {
+			changes.push({
 				type: "upsert" as const,
 				key: String(item.instance_id),
 				icon: Builder.imageIcon(coverUrl),
@@ -87,11 +115,13 @@ worker.sync("collectionSync", {
 						`https://www.discogs.com/release/${releaseId}`,
 					),
 					Cover: Builder.file(coverUrl, `${coverAlt}.jpg`),
+					"Cover URL": Builder.url(coverUrl),
+					"Cover Base64": richTextChunked(coverBase64),
 					"Instance ID": Builder.richText(String(item.instance_id)),
 					"Release ID": Builder.richText(releaseId),
 				},
-			};
-		});
+			});
+		}
 
 		const totalPages = data.pagination?.pages ?? 1;
 		const hasMore = page < totalPages;
@@ -178,7 +208,7 @@ async function fetchCollectionPage(args: {
 		`https://api.discogs.com/users/${encodeURIComponent(args.username)}/collection/folders/0/releases`,
 	);
 	url.searchParams.set("page", String(args.page));
-	url.searchParams.set("per_page", "100");
+	url.searchParams.set("per_page", String(COLLECTION_PAGE_SIZE));
 	url.searchParams.set("sort", "added");
 	url.searchParams.set("sort_order", "desc");
 
@@ -200,7 +230,61 @@ async function fetchCollectionPage(args: {
 	return (await res.json()) as DiscogsCollectionResponse;
 }
 
+// Downloads cover art, downscales it to fit within COVER_MAX_DIMENSION, and returns
+// it as a base64 data URI (e.g. "data:image/jpeg;base64,/9j/4AAQ..."), directly
+// usable as an <img src>. Returns "" if the image can't be fetched or decoded.
+async function fetchResizedCoverAsBase64(url: string): Promise<string> {
+	await discogsImages.wait();
+
+	let original: Buffer;
+	try {
+		const res = await fetch(url, {
+			headers: {
+				"User-Agent": "NotionDiscogsCollectionSync/1.0",
+				Accept: "image/*",
+			},
+		});
+		if (!res.ok) {
+			console.warn(`Cover fetch returned ${res.status} for ${url}`);
+			return "";
+		}
+		original = Buffer.from(await res.arrayBuffer());
+	} catch (error) {
+		console.warn(`Cover fetch failed for ${url}: ${String(error)}`);
+		return "";
+	}
+
+	try {
+		const image = await Jimp.read(original);
+		// scaleToFit preserves aspect ratio, so a non-square sleeve (Discogs has
+		// plenty, e.g. 595x600) is bounded rather than squashed into a square.
+		const resized = image.scaleToFit({
+			w: COVER_MAX_DIMENSION,
+			h: COVER_MAX_DIMENSION,
+		});
+		const jpeg = await resized.getBuffer("image/jpeg", {
+			quality: COVER_JPEG_QUALITY,
+		});
+		return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+	} catch (error) {
+		console.warn(`Cover resize failed for ${url}: ${String(error)}`);
+		return "";
+	}
+}
+
 // ---- Helpers ----
+
+// Notion rejects a rich text token longer than 2000 characters, so split long
+// content across consecutive tokens. Notion concatenates them back into one value.
+function richTextChunked(content: string): [string][] {
+	if (content.length <= RICH_TEXT_TOKEN_LIMIT) return [[content]];
+
+	const tokens: [string][] = [];
+	for (let i = 0; i < content.length; i += RICH_TEXT_TOKEN_LIMIT) {
+		tokens.push([content.slice(i, i + RICH_TEXT_TOKEN_LIMIT)]);
+	}
+	return tokens;
+}
 
 function requireEnv(name: string): string {
 	const value = process.env[name];

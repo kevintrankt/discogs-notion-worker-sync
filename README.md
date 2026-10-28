@@ -24,6 +24,8 @@ Every release in your Discogs collection's "All" folder, with the following prop
 | Date Added | Date | When the release was added to your collection |
 | Discogs URL | URL | Link to the release page |
 | Cover | File | Album cover image |
+| Cover URL | URL | Direct link to the cover image |
+| Cover Base64 | Text | Cover downscaled to fit 100x100, as a `data:image/jpeg;base64,...` URI |
 | Instance ID | Text | Primary key (each copy gets its own row) |
 | Release ID | Text | Discogs release ID |
 | **Page icon** | — | Set to the album cover image |
